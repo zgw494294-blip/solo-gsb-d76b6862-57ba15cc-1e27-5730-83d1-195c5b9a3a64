@@ -4,20 +4,109 @@ const MAX_RUNNERS = 3;
 const MAX_RECORDS = 40;
 const GATE_LABELS = { S: "起点 S", M: "中途门 M", F: "终点 F" };
 
-/* ---------- 选手行编号追踪与罚秒归属（须先于所有事件监听与行创建声明） ---------- */
+/* ---------- 大整数编号无损工具（须先于所有事件监听与行创建声明） ---------- */
+
+// 后端接受的编号是任意精度正整数，可能超出 JS 安全整数范围（如 9007199254740993，
+// Number 会把它舍入成与 9007199254740992 相同的值）。页面内一律以“规范十进制
+// 字符串”（去前导零）作为编号身份：不同编号绝不混同，"0101" 与 "101" 仍是同一编号。
+function canonicalIntText(value) {
+  if (typeof value === "number") {
+    // 响应经无损解析后，number 必是安全整数。
+    return Number.isSafeInteger(value) && value >= 0 ? String(value) : null;
+  }
+  if (typeof value === "string") {
+    const t = value.trim();
+    if (!/^\d+$/.test(t)) return null;
+    return t.replace(/^0+(?=\d)/, "");
+  }
+  return null;
+}
+
+// 规范十进制非负整数比较：位数多者大；同位数字典序即数值序。
+function compareIntTexts(a, b) {
+  if (a.length !== b.length) return a.length < b.length ? -1 : 1;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+// 精确差值比较 hi - lo === diff：BigInt 计算不丢精度；任一值非法即不相等。
+function intDiffEq(hi, lo, diff) {
+  try {
+    return BigInt(hi) - BigInt(lo) === BigInt(diff);
+  } catch (err) {
+    return false;
+  }
+}
+
+// 无损解析响应 JSON：超出安全整数范围的整数字面量改写为字符串后再 JSON.parse，
+// 避免 9007199254740993 这类大整数编号被舍入而与相邻编号混同；安全整数仍是 number。
+function parseJsonLossless(text) {
+  let out = "";
+  let i = 0;
+  const n = text.length;
+  let inString = false;
+  while (i < n) {
+    const c = text[i];
+    if (inString) {
+      if (c === "\\" && i + 1 < n) {
+        out += c + text[i + 1];
+        i += 2;
+        continue;
+      }
+      out += c;
+      if (c === '"') inString = false;
+      i += 1;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      out += c;
+      i += 1;
+      continue;
+    }
+    if (c === "-" || (c >= "0" && c <= "9")) {
+      let j = i + 1;
+      while (j < n && text[j] >= "0" && text[j] <= "9") j += 1;
+      let isFloat = false;
+      if (text[j] === ".") {
+        isFloat = true;
+        j += 1;
+        while (j < n && text[j] >= "0" && text[j] <= "9") j += 1;
+      }
+      if (text[j] === "e" || text[j] === "E") {
+        isFloat = true;
+        j += 1;
+        if (text[j] === "+" || text[j] === "-") j += 1;
+        while (j < n && text[j] >= "0" && text[j] <= "9") j += 1;
+      }
+      const literal = text.slice(i, j);
+      out +=
+        !isFloat && !Number.isSafeInteger(Number(literal))
+          ? JSON.stringify(literal) // 超范围整数 → 字符串，精确保留每一位
+          : literal;
+      i = j;
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return JSON.parse(out);
+}
+
+/* ---------- 选手行编号追踪与罚秒归属 ---------- */
 
 // 罚秒只绑定选手编号，仅用于名次表：不改变采纳记录、裁决用时或人工复核。
-// 仅保存在页面内存中，刷新页面即全部清除。
-const penalties = new Map(); // runnerNumber -> { seconds: number, reason: string }
+// 仅保存在页面内存中，刷新页面即全部清除。键为编号的规范十进制字符串。
+const penalties = new Map(); // runnerNumberText -> { seconds: number, reason: string }
 const MAX_PENALTY_REASON = 200;
 
-// 按“行”追踪每行当前登记的编号（数字，空/非法为 null）。罚秒虽按编号保存，
+// 按“行”追踪每行当前登记的编号（规范十进制字符串，空/非法为 null）。罚秒虽按编号保存，
 // 但编号的归属跟随行：一行离开旧编号（改号、清空、删行）的那一刻，旧编号的
 // 罚秒必须立即释放——即使另一行仍占用该编号（临时重号），也不等重算、不看合法性。
 const runnerRowNumbers = new WeakMap();
 
 function parseRunnerNumber(value) {
-  return /^\d+$/.test(value) ? Number(value) : null;
+  // 大整数编号不经 Number 舍入：返回规范十进制字符串（空/非法为 null）。
+  return canonicalIntText(value);
 }
 
 function releaseRunnerPenalty(number) {
@@ -193,7 +282,8 @@ async function runAdjudication() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(collectPayload()),
     });
-    data = await resp.json();
+    // 先取原文再无损解析：大整数编号不会被 JSON.parse 舍入混同。
+    data = parseJsonLossless(await resp.text());
   } catch (err) {
     if (version !== inputVersion) return; // 过期的失败不得覆盖较新状态
     pendingHint.hidden = true;
@@ -242,19 +332,22 @@ const MAX_REVIEW_NOTE = 200;
 let renderedLapKeys = [];
 
 function currentStandards() {
+  // 规范十进制字符串：超大区间值在复核绑定比较中同样精确。
   return ["smMin", "smMax", "mfMin", "mfMax"].map((id) =>
-    Number(document.getElementById(id).value.trim())
+    canonicalIntText(document.getElementById(id).value)
   );
 }
 
 function lapReviewKey(runner, lap, standards) {
+  // 编号与秒数统一为规范十进制文本：大整数趟的绑定键同样精确、可比较。
+  const t = (v) => canonicalIntText(v) ?? v;
   return JSON.stringify([
-    runner,
-    [lap.start.id, "S", lap.start.time],
-    [lap.middle.id, "M", lap.middle.time],
-    [lap.finish.id, "F", lap.finish.time],
-    lap.smTime,
-    lap.mfTime,
+    t(runner),
+    [lap.start.id, "S", t(lap.start.time)],
+    [lap.middle.id, "M", t(lap.middle.time)],
+    [lap.finish.id, "F", t(lap.finish.time)],
+    t(lap.smTime),
+    t(lap.mfTime),
     standards,
   ]);
 }
@@ -267,9 +360,8 @@ function pruneReviewsByBindings() {
 
   const runnerNumbers = new Set(
     [...runnerRows.querySelectorAll(".runner-number")]
-      .map((el) => el.value.trim())
-      .filter((v) => v !== "")
-      .map(Number)
+      .map((el) => canonicalIntText(el.value))
+      .filter((v) => v !== null)
   );
 
   // 以记录 ID 为索引：绑定按 ID 定位，ID 缺失即记录被删除；
@@ -290,11 +382,11 @@ function pruneReviewsByBindings() {
     });
   }
 
-  const intText = (v) => (/^\d+$/.test(v) ? Number(v) : NaN);
+  // 编号与秒数都按规范十进制文本比较：大整数绑定值同样精确匹配。
   const recordMatches = (rec, gate, time) =>
     rec !== undefined &&
     rec.gate === gate &&
-    intText(rec.time) === time;
+    canonicalIntText(rec.time) === time;
 
   for (const key of [...reviews.keys()]) {
     let parts;
@@ -329,16 +421,17 @@ function pruneReviewsByBindings() {
 
     if (valid) {
       // 绑定记录的选手编号必须仍是该选手；门/秒数不变时两段耗时自然不变，
-      // 这里仍显式核对一次，避免任何不一致的键残留。
+      // 这里仍显式核对一次，避免任何不一致的键残留。编号与耗时差值都按
+      // 规范文本 / BigInt 精确比较，大整数趟的绑定不会误判失效或误判有效。
       const sRec = recordsById.get(sId);
       const mRec = recordsById.get(mId);
       const fRec = recordsById.get(fId);
       valid =
-        intText(sRec.runner.trim()) === runner &&
-        intText(mRec.runner.trim()) === runner &&
-        intText(fRec.runner.trim()) === runner &&
-        mTime - sTime === smTime &&
-        fTime - mTime === mfTime;
+        canonicalIntText(sRec.runner) === runner &&
+        canonicalIntText(mRec.runner) === runner &&
+        canonicalIntText(fRec.runner) === runner &&
+        intDiffEq(mTime, sTime, smTime) &&
+        intDiffEq(fTime, mTime, mfTime);
     }
 
     if (!valid) reviews.delete(key);
@@ -414,8 +507,11 @@ resultsBox.addEventListener("click", (e) => {
 // 最近一次展示的合法裁决结果：保存罚秒后据此立即重排名次，无需重新请求。
 let latestResult = null;
 
-// 仅供无浏览器生命周期测试（test_ranking_lifecycle.js）直接断言内存中的罚秒。
-if (typeof globalThis !== "undefined") globalThis.__penaltiesForTest = penalties;
+// 仅供无浏览器生命周期测试直接断言内存中的罚秒与无损解析。
+if (typeof globalThis !== "undefined") {
+  globalThis.__penaltiesForTest = penalties;
+  globalThis.__parseJsonLosslessForTest = parseJsonLossless;
+}
 
 // 删行时（在 DOM remove 之前调用）：该行已不在表单中，直接释放其原编号罚秒。
 function releasePenaltyForRemovedRunner(row) {
@@ -454,16 +550,21 @@ function prunePenaltiesByRunners() {
 // 名次：有完整计次者按计次数降序、调整后用时（原总用时 + 罚秒）升序，
 // 同值共享名次并跳号（1、1、3），并列按编号升序展示；
 // 零次者排末尾、按编号升序且无名次。
+// 编号与调整后用时都按规范十进制文本精确比较，大整数编号排序不丢精度。
 function computeRanking(runners) {
   const rows = runners.map((r) => {
     const saved = penalties.get(r.runner);
     const penalty = saved ? saved.seconds : 0;
     return {
-      runner: r.runner,
+      runner: r.runner, // 规范十进制字符串
       lapCount: r.lapCount,
       totalTime: r.totalTime,
       penalty,
-      adjusted: r.totalTime + penalty,
+      // 总用时可能是大整数：用 BigInt 求和，调整后用时保持精确。
+      adjusted: (
+        BigInt(canonicalIntText(r.totalTime) ?? "0") +
+        BigInt(canonicalIntText(penalty) ?? "0")
+      ).toString(),
       rank: null,
     };
   });
@@ -471,7 +572,9 @@ function computeRanking(runners) {
     .filter((row) => row.lapCount > 0)
     .sort(
       (a, b) =>
-        b.lapCount - a.lapCount || a.adjusted - b.adjusted || a.runner - b.runner
+        b.lapCount - a.lapCount ||
+        compareIntTexts(a.adjusted, b.adjusted) ||
+        compareIntTexts(a.runner, b.runner)
     );
   ranked.forEach((row, i) => {
     row.rank =
@@ -483,7 +586,7 @@ function computeRanking(runners) {
   });
   const zeros = rows
     .filter((row) => row.lapCount === 0)
-    .sort((a, b) => a.runner - b.runner);
+    .sort((a, b) => compareIntTexts(a.runner, b.runner));
   return ranked.concat(zeros);
 }
 
@@ -547,7 +650,8 @@ resultsBox.addEventListener("click", (e) => {
   if (!e.target.classList.contains("penalty-save")) return;
   const box = e.target.closest(".penalty-editor");
   if (!box) return;
-  const runner = Number(box.dataset.runner);
+  // 编号是规范十进制字符串：大整数编号归属罚秒时不经 Number 舍入。
+  const runner = box.dataset.runner;
   const secondsText = box.querySelector(".penalty-seconds").value.trim();
   const reason = box.querySelector(".penalty-reason").value;
   const errEl = box.querySelector(".penalty-error");
@@ -588,6 +692,8 @@ function gateChip(gate, id, time) {
 
 function renderResults(result) {
   latestResult = result; // 名次表与罚秒保存都以这份最新合法结果为准
+  // 编号统一为规范十进制字符串：从响应到展示、罚秒归属、名次排序与复核绑定全程无损。
+  for (const r of result.runners) r.runner = canonicalIntText(r.runner) ?? r.runner;
   const standards = currentStandards();
   const keyOf = (runner, lap) => lapReviewKey(runner, lap, standards);
 

@@ -39,7 +39,8 @@ class El {
     this._html = html;
     this.children = [];
     // 解析为子节点：名次表槽位、罚秒编辑器等都可被 querySelector 找到。
-    if (html) parseHtml(html).forEach((n) => this.appendChild(n));
+    // parseHtml 返回活动数组：appendChild 会把节点从 root 摘除，须遍历副本。
+    if (html) [...parseHtml(html)].forEach((n) => this.appendChild(n));
   }
   get innerHTML() { return this._html; }
   appendChild(c) {
@@ -53,7 +54,7 @@ class El {
     if (i >= 0) this.children.splice(i, 1);
   }
   remove() { if (this.parent) { this.parent._remove(this); this.parent = null; } }
-  insertAdjacentHTML(_pos, html) { parseHtml(html).forEach((n) => this.appendChild(n)); }
+  insertAdjacentHTML(_pos, html) { [...parseHtml(html)].forEach((n) => this.appendChild(n)); }
   addEventListener(type, fn) {
     if (!this._listeners.has(type)) this._listeners.set(type, []);
     this._listeners.get(type).push(fn);
@@ -211,14 +212,21 @@ let fetchCount = 0;
 global.fetch = async (_url, opts) => {
   fetchCount++;
   JSON.parse(opts.body); // 前端始终发送合法 JSON
+  // 与真实浏览器一致：同时提供 json() 与 text()；app.js 用 text() 做无损解析。
+  const respond = (ok, status, payload) => ({
+    ok,
+    status,
+    json: async () => payload,
+    text: async () => JSON.stringify(payload),
+  });
   if (server.mode === "invalid") {
-    return { ok: false, status: 422, json: async () => ({ ok: false, error: "模拟非法输入" }) };
+    return respond(false, 422, { ok: false, error: "模拟非法输入" });
   }
   if (server.mode === "hold") {
     const data = await server.hold;
-    return { ok: true, status: 200, json: async () => data };
+    return respond(true, 200, data);
   }
-  return { ok: true, status: 200, json: async () => ({ ok: true, result: server.result }) };
+  return respond(true, 200, { ok: true, result: server.result });
 };
 
 /* ---------------- 加载真实 app.js ---------------- */
@@ -457,16 +465,16 @@ async function main() {
   // 步骤 1：把 101 行改成 102（临时重号，输入非法）。改行离开的原编号是 101，
   // 故只清 101；原 102 行（罚秒的归属行）尚未改号，其 7 秒在本步仍保留。
   setRunnerAndFire(dup101, "102");
-  assert(!globalThis.__penaltiesForTest.has(101), "临时重号瞬间：改行的原编号 101 的 3 秒立即清除");
-  assert(globalThis.__penaltiesForTest.get(102).seconds === 7,
+  assert(!globalThis.__penaltiesForTest.has("101"), "临时重号瞬间：改行的原编号 101 的 3 秒立即清除");
+  assert(globalThis.__penaltiesForTest.get("102").seconds === 7,
     "原 102 行尚未改号：102 的 7 秒仍归属该行，本步保留");
-  assert(globalThis.__penaltiesForTest.get(103).seconds === 9, "同一事件中未改号的 103 不受影响");
+  assert(globalThis.__penaltiesForTest.get("103").seconds === 9, "同一事件中未改号的 103 不受影响");
   await adjudicate(); // 桩服务器不校验重号仍返回结果
   assert(slotHtml().includes(rowHtml(102, 1, 20, 7, 27, "第 1 名")), "归属行未改号前，名次仍按 102 的 7 秒展示");
   // 步骤 2：把原 102 行改为 104——此刻另一行仍占用 102，但该行离开了原编号 102，
   // 102 的 7 秒与原因必须在输入事件当下立即清除（不等待重算、不因重号而残留）。
   setRunnerAndFire(dup102, "104");
-  assert(!globalThis.__penaltiesForTest.has(102),
+  assert(!globalThis.__penaltiesForTest.has("102"),
     "原 102 行改号瞬间：另一行仍占用 102，其 7 秒与原因仍被立即清除");
   await adjudicate();
   assert(slotHtml().includes(rowHtml(102, 1, 20, 0, 20, "第 1 名")), "原 102 的 7 秒未留存：102 现为默认 0 秒");
@@ -476,7 +484,7 @@ async function main() {
   assert(slotHtml().includes(rowHtml(103, 0, 0, 9, 9, "—")), "未改号的 103 罚秒 9 不受影响");
   // 步骤 3：把 104 行改回 102（再次临时重号），罚秒同样不得恢复。
   setRunnerAndFire(dup102, "102");
-  assert(!globalThis.__penaltiesForTest.has(102), "再次临时重号瞬间：102 罚秒仍为空，不恢复");
+  assert(!globalThis.__penaltiesForTest.has("102"), "再次临时重号瞬间：102 罚秒仍为空，不恢复");
   // 步骤 4：把第一行改回 101，重号全部解除。
   setRunnerAndFire(dup101, "101");
   await adjudicate();
@@ -501,15 +509,15 @@ async function main() {
   // 三行：101 / 102 / 103。给 103 保存罚秒后，把 101 行改成 103（临时重号），
   // 再删除原 103 行：删除瞬间 103 的罚秒必须清掉，尽管改成 103 的另一行仍占用该编号。
   savePenalty(103, "6", "阻挡");
-  assert(globalThis.__penaltiesForTest.get(103).seconds === 6, "前置：103 罚秒 6 已生效");
+  assert(globalThis.__penaltiesForTest.get("103").seconds === 6, "前置：103 罚秒 6 已生效");
   const rowDel101 = dup101; // 上一场景结束时该行正是 101
   setRunnerAndFire(rowDel101, "103"); // 101→103，103 原行还在：改号释放的是 101（无罚秒）
-  assert(globalThis.__penaltiesForTest.get(103).seconds === 6, "改号行只是占用 103：原 103 的 6 秒在原行删除前仍在");
+  assert(globalThis.__penaltiesForTest.get("103").seconds === 6, "改号行只是占用 103：原 103 的 6 秒在原行删除前仍在");
   // 出现两个 103 行：删除的是“原本就是 103”的那一行，不是刚改过来的行。
   const rowOrig103 = [...runnerRows.querySelectorAll(".runner-row")]
     .find((x) => x !== rowDel101 && x.querySelector(".runner-number").value === "103");
   fire(rowOrig103.querySelector(".remove-runner"), "click"); // 删除原 103 行
-  assert(!globalThis.__penaltiesForTest.has(103), "删除瞬间：另一行仍占用 103，其 6 秒与原因仍被立即清除");
+  assert(!globalThis.__penaltiesForTest.has("103"), "删除瞬间：另一行仍占用 103，其 6 秒与原因仍被立即清除");
 
   // 补一名 101 选手，恢复三行状态进入后续场景。
   fire(addRunner, "click");

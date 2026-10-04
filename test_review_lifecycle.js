@@ -50,7 +50,7 @@ class El {
     if (i >= 0) this.children.splice(i, 1);
   }
   remove() { if (this.parent) { this.parent._remove(this); this.parent = null; } }
-  insertAdjacentHTML(_pos, html) { parseHtml(html).forEach((n) => this.appendChild(n)); }
+  insertAdjacentHTML(_pos, html) { [...parseHtml(html)].forEach((n) => this.appendChild(n)); }
   addEventListener(type, fn) {
     if (!this._listeners.has(type)) this._listeners.set(type, []);
     this._listeners.get(type).push(fn);
@@ -190,14 +190,21 @@ const twoLapResult = {
 const server = { mode: "valid", result: validResult, hold: null };
 global.fetch = async (_url, opts) => {
   JSON.parse(opts.body); // 前端始终发送合法 JSON
+  // 与真实浏览器一致：同时提供 json() 与 text()；app.js 用 text() 做无损解析。
+  const respond = (ok, status, payload) => ({
+    ok,
+    status,
+    json: async () => payload,
+    text: async () => JSON.stringify(payload),
+  });
   if (server.mode === "invalid") {
-    return { ok: false, status: 422, json: async () => ({ ok: false, error: "模拟非法输入" }) };
+    return respond(false, 422, { ok: false, error: "模拟非法输入" });
   }
   if (server.mode === "hold") {
     const data = await server.hold;
-    return { ok: true, status: 200, json: async () => data };
+    return respond(true, 200, data);
   }
-  return { ok: true, status: 200, json: async () => ({ ok: true, result: server.result }) };
+  return respond(true, 200, { ok: true, result: server.result });
 };
 
 /* ---------------- 加载真实 app.js ---------------- */

@@ -1,6 +1,7 @@
 """对裁决算法的正确性测试：固定用例 + 随机数据对拍暴力枚举。"""
 
 import copy
+import json
 import random
 import sys
 
@@ -109,6 +110,44 @@ def test_sample():
     assert r2["lapCount"] == 1 and r2["laps"][0]["start"]["id"] == "d1"
     assert len(r2["unused"]) == 0
     print("test_sample OK")
+
+
+def test_bigint_runner_numbers():
+    """大整数编号（超出 JS 安全整数范围）在后端全程精确：解析、去重、归属、响应。"""
+    big_a = 9007199254740992  # 2**53
+    big_b = 9007199254740993  # 2**53 + 1（JS Number 无法与前者区分）
+    payload = {
+        "standards": {"smMin": 10, "smMax": 60, "mfMin": 10, "mfMax": 60},
+        "runners": [{"number": str(big_a)}, {"number": str(big_b)}],
+        "records": [
+            {"id": "a1", "runner": str(big_a), "gate": "S", "time": 0},
+            {"id": "b1", "runner": str(big_a), "gate": "M", "time": 10},
+            {"id": "c1", "runner": str(big_a), "gate": "F", "time": 20},
+            {"id": "d1", "runner": str(big_b), "gate": "S", "time": 0},
+            {"id": "e1", "runner": str(big_b), "gate": "M", "time": 10},
+            {"id": "f1", "runner": str(big_b), "gate": "F", "time": 20},
+        ],
+    }
+    out = adjudicate(payload)
+    # 两个编号互异且各自精确：不会被舍入混同，也不会误判重复。
+    assert [r["runner"] for r in out["runners"]] == [big_a, big_b]
+    assert all(r["lapCount"] == 1 for r in out["runners"])
+    # 记录归属精确：…992 的趟不会算到 …993 名下。
+    assert out["runners"][0]["laps"][0]["start"]["id"] == "a1"
+    assert out["runners"][1]["laps"][0]["start"]["id"] == "d1"
+    # 响应 JSON 序列化不丢精度（前端据此做无损解析）。
+    text = json.dumps(out, ensure_ascii=False)
+    assert str(big_a) in text and str(big_b) in text
+
+    # 前导零等值写法视为同一编号：与去重规则一致。
+    dup = copy.deepcopy(payload)
+    dup["runners"] = [{"number": "0" + str(big_a)}, {"number": str(big_a)}]
+    try:
+        parse_payload(dup)
+        raise AssertionError("前导零等值编号应判重复")
+    except AdjudicationError:
+        pass
+    print("test_bigint_runner_numbers OK")
 
 
 def test_zero_laps():
@@ -273,6 +312,7 @@ def random_fuzz(seed, n_records):
 
 if __name__ == "__main__":
     test_sample()
+    test_bigint_runner_numbers()
     test_zero_laps()
     test_inclusive_bounds()
     test_strict_separation_and_sharing()
