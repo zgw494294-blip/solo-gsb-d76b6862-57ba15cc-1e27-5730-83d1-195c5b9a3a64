@@ -1,6 +1,7 @@
 """对裁决算法的正确性测试：固定用例 + 随机数据对拍暴力枚举。"""
 
 import copy
+import json
 import random
 import sys
 
@@ -271,6 +272,48 @@ def random_fuzz(seed, n_records):
         assert b["start"]["time"] > a["finish"]["time"]
 
 
+def test_big_runner_numbers():
+    """超过 2^53 的编号：后端精确接收、区分并原样返回（JSON 数字不截断）。"""
+    big1 = 9007199254740992  # 2^53
+    big2 = 9007199254740993  # 2^53 + 1，JS Number 无法区分二者
+    payload = {
+        "standards": {"smMin": 10, "smMax": 60, "mfMin": 10, "mfMax": 60},
+        "runners": [{"number": str(big1)}, {"number": str(big2)}],
+        "records": [
+            {"id": "a1", "runner": str(big1), "gate": "S", "time": 0},
+            {"id": "b1", "runner": str(big1), "gate": "M", "time": 10},
+            {"id": "c1", "runner": str(big1), "gate": "F", "time": 20},
+            {"id": "d1", "runner": str(big2), "gate": "S", "time": 0},
+            {"id": "e1", "runner": str(big2), "gate": "M", "time": 11},
+            {"id": "f1", "runner": str(big2), "gate": "F", "time": 22},
+        ],
+    }
+    out = adjudicate(payload)
+    assert [r["runner"] for r in out["runners"]] == [big1, big2]
+    assert [r["lapCount"] for r in out["runners"]] == [1, 1]
+    # JSON 序列化/反序列化全程保持精确值，前端可无损解析
+    text = json.dumps(out)
+    assert f'"runner": {big1}' in text and f'"runner": {big2}' in text
+    again = json.loads(text)
+    assert [r["runner"] for r in again["runners"]] == [big1, big2]
+
+    # 前导零等值写法归一为同一编号；等值写法判重
+    ids, _, _ = parse_payload({
+        "standards": {"smMin": 10, "smMax": 60, "mfMin": 10, "mfMax": 60},
+        "runners": [{"number": "09007199254740992"}, {"number": "007"}],
+        "records": [],
+    })
+    assert ids == [big1, 7]
+    dup = copy.deepcopy(payload)
+    dup["runners"] = [{"number": str(big1)}, {"number": "0" + str(big1)}]
+    try:
+        parse_payload(dup)
+        raise AssertionError("前导零等值编号应判重")
+    except AdjudicationError:
+        pass
+    print("test_big_runner_numbers OK")
+
+
 if __name__ == "__main__":
     test_sample()
     test_zero_laps()
@@ -281,6 +324,7 @@ if __name__ == "__main__":
     test_lex_tiebreak_multilap()
     test_count_beats_time()
     test_validation()
+    test_big_runner_numbers()
     for seed in range(400):
         random_fuzz(seed, 6 + seed % 10)
     print("fuzz x400 OK")

@@ -206,19 +206,28 @@ const fixtureB = {
   ],
 };
 
-const server = { mode: "valid", result: fixtureA, hold: null };
+const server = { mode: "valid", result: fixtureA, hold: null, raw: null };
 let fetchCount = 0;
 global.fetch = async (_url, opts) => {
   fetchCount++;
   JSON.parse(opts.body); // 前端始终发送合法 JSON
+  // raw：直接以原文返回，模拟后端精确输出的大整数编号（JSON 数字可超过 2^53）。
+  const respond = (data, ok, status) => ({
+    ok,
+    status,
+    json: async () => (typeof data === "string" ? JSON.parse(data) : data),
+    text: async () => (typeof data === "string" ? data : JSON.stringify(data)),
+  });
   if (server.mode === "invalid") {
-    return { ok: false, status: 422, json: async () => ({ ok: false, error: "模拟非法输入" }) };
+    return respond({ ok: false, error: "模拟非法输入" }, false, 422);
   }
   if (server.mode === "hold") {
-    const data = await server.hold;
-    return { ok: true, status: 200, json: async () => data };
+    return respond(await server.hold, true, 200);
   }
-  return { ok: true, status: 200, json: async () => ({ ok: true, result: server.result }) };
+  if (server.raw !== null) {
+    return respond(server.raw, true, 200);
+  }
+  return respond({ ok: true, result: server.result }, true, 200);
 };
 
 /* ---------------- 加载真实 app.js ---------------- */
@@ -457,16 +466,16 @@ async function main() {
   // 步骤 1：把 101 行改成 102（临时重号，输入非法）。改行离开的原编号是 101，
   // 故只清 101；原 102 行（罚秒的归属行）尚未改号，其 7 秒在本步仍保留。
   setRunnerAndFire(dup101, "102");
-  assert(!globalThis.__penaltiesForTest.has(101), "临时重号瞬间：改行的原编号 101 的 3 秒立即清除");
-  assert(globalThis.__penaltiesForTest.get(102).seconds === 7,
+  assert(!globalThis.__penaltiesForTest.has("101"), "临时重号瞬间：改行的原编号 101 的 3 秒立即清除");
+  assert(globalThis.__penaltiesForTest.get("102").seconds === 7,
     "原 102 行尚未改号：102 的 7 秒仍归属该行，本步保留");
-  assert(globalThis.__penaltiesForTest.get(103).seconds === 9, "同一事件中未改号的 103 不受影响");
+  assert(globalThis.__penaltiesForTest.get("103").seconds === 9, "同一事件中未改号的 103 不受影响");
   await adjudicate(); // 桩服务器不校验重号仍返回结果
   assert(slotHtml().includes(rowHtml(102, 1, 20, 7, 27, "第 1 名")), "归属行未改号前，名次仍按 102 的 7 秒展示");
   // 步骤 2：把原 102 行改为 104——此刻另一行仍占用 102，但该行离开了原编号 102，
   // 102 的 7 秒与原因必须在输入事件当下立即清除（不等待重算、不因重号而残留）。
   setRunnerAndFire(dup102, "104");
-  assert(!globalThis.__penaltiesForTest.has(102),
+  assert(!globalThis.__penaltiesForTest.has("102"),
     "原 102 行改号瞬间：另一行仍占用 102，其 7 秒与原因仍被立即清除");
   await adjudicate();
   assert(slotHtml().includes(rowHtml(102, 1, 20, 0, 20, "第 1 名")), "原 102 的 7 秒未留存：102 现为默认 0 秒");
@@ -476,7 +485,7 @@ async function main() {
   assert(slotHtml().includes(rowHtml(103, 0, 0, 9, 9, "—")), "未改号的 103 罚秒 9 不受影响");
   // 步骤 3：把 104 行改回 102（再次临时重号），罚秒同样不得恢复。
   setRunnerAndFire(dup102, "102");
-  assert(!globalThis.__penaltiesForTest.has(102), "再次临时重号瞬间：102 罚秒仍为空，不恢复");
+  assert(!globalThis.__penaltiesForTest.has("102"), "再次临时重号瞬间：102 罚秒仍为空，不恢复");
   // 步骤 4：把第一行改回 101，重号全部解除。
   setRunnerAndFire(dup101, "101");
   await adjudicate();
@@ -501,15 +510,15 @@ async function main() {
   // 三行：101 / 102 / 103。给 103 保存罚秒后，把 101 行改成 103（临时重号），
   // 再删除原 103 行：删除瞬间 103 的罚秒必须清掉，尽管改成 103 的另一行仍占用该编号。
   savePenalty(103, "6", "阻挡");
-  assert(globalThis.__penaltiesForTest.get(103).seconds === 6, "前置：103 罚秒 6 已生效");
+  assert(globalThis.__penaltiesForTest.get("103").seconds === 6, "前置：103 罚秒 6 已生效");
   const rowDel101 = dup101; // 上一场景结束时该行正是 101
   setRunnerAndFire(rowDel101, "103"); // 101→103，103 原行还在：改号释放的是 101（无罚秒）
-  assert(globalThis.__penaltiesForTest.get(103).seconds === 6, "改号行只是占用 103：原 103 的 6 秒在原行删除前仍在");
+  assert(globalThis.__penaltiesForTest.get("103").seconds === 6, "改号行只是占用 103：原 103 的 6 秒在原行删除前仍在");
   // 出现两个 103 行：删除的是“原本就是 103”的那一行，不是刚改过来的行。
   const rowOrig103 = [...runnerRows.querySelectorAll(".runner-row")]
     .find((x) => x !== rowDel101 && x.querySelector(".runner-number").value === "103");
   fire(rowOrig103.querySelector(".remove-runner"), "click"); // 删除原 103 行
-  assert(!globalThis.__penaltiesForTest.has(103), "删除瞬间：另一行仍占用 103，其 6 秒与原因仍被立即清除");
+  assert(!globalThis.__penaltiesForTest.has("103"), "删除瞬间：另一行仍占用 103，其 6 秒与原因仍被立即清除");
 
   // 补一名 101 选手，恢复三行状态进入后续场景。
   fire(addRunner, "click");
@@ -527,6 +536,102 @@ async function main() {
   fire($("clear-btn"), "click");
   await flush();
   assert(results.innerHTML === "" && $("error-box").hidden, "清空后名次表立即隐藏");
+
+  console.log("大整数编号：超过 2^53 的编号显示、罚秒归属与排序均不混同");
+  // 2^53 与 2^53+1：JS Number 无法区分（都会变成 9007199254740992），
+  // 后端按任意精度整数接收并原样返回，页面从响应到展示须全程无损。
+  const BIG_A = "9007199254740992";
+  const BIG_B = "9007199254740993";
+  const bigLapA =
+    `{"start":{"id":"ba1","time":0},"middle":{"id":"bb1","time":10},` +
+    `"finish":{"id":"bc1","time":20},"smTime":10,"mfTime":10,"totalTime":20}`;
+  const bigLapB =
+    `{"start":{"id":"bd1","time":0},"middle":{"id":"be1","time":11},` +
+    `"finish":{"id":"bf1","time":22},"smTime":11,"mfTime":11,"totalTime":22}`;
+  const bigRunner = (num, lap, laps, total) =>
+    `{"runner":${num},"lapCount":${laps},"totalTime":${total},"laps":[${lap}],"unused":[]}`;
+  setVal("smMin", "10"); setVal("smMax", "60"); setVal("mfMin", "10"); setVal("mfMax", "60");
+  fire(addRunner, "click"); // 共 2 行选手
+  numInputs()[0].value = BIG_A; numInputs()[1].value = BIG_B;
+  fire(runnerRows, "input");
+  for (let i = 0; i < 5; i++) fire(addRecord, "click"); // 共 6 行记录
+  [
+    ["ba1", BIG_A, "S", "0"], ["bb1", BIG_A, "M", "10"], ["bc1", BIG_A, "F", "20"],
+    ["bd1", BIG_B, "S", "0"], ["be1", BIG_B, "M", "11"], ["bf1", BIG_B, "F", "22"],
+  ].forEach((r) => setRow(...r));
+  server.raw = `{"ok":true,"result":{"runners":[` +
+    `${bigRunner(BIG_A, bigLapA, 1, 20)},${bigRunner(BIG_B, bigLapB, 1, 22)}]}}`;
+  await adjudicate();
+  assert(
+    slotHtml().includes(`<td>${BIG_A}</td>`) && slotHtml().includes(`<td>${BIG_B}</td>`),
+    "名次表分别显示两个大编号（不再显示成同一编号）"
+  );
+  assert(
+    results.innerHTML.includes(`选手 ${BIG_A}`) && results.innerHTML.includes(`选手 ${BIG_B}`),
+    "选手卡分别显示两个大编号"
+  );
+  assert(!!editorOf(BIG_A) && !!editorOf(BIG_B), "两个大编号各有独立的罚秒编辑区");
+  r = savePenalty(BIG_A, "7", "大编号踩线");
+  assert(r.error.hidden, "大编号罚秒保存成功");
+  assert(globalThis.__penaltiesForTest.get(BIG_A).seconds === 7, "前者的 7 秒按精确编号归属");
+  assert(!globalThis.__penaltiesForTest.has(BIG_B), "保存前者罚秒不影响后者");
+  assert(slotHtml().includes(rowHtml(BIG_A, 1, 20, 7, 27, "第 2 名")), "前者调整后 27 秒排第 2");
+  assert(slotHtml().includes(rowHtml(BIG_B, 1, 22, 0, 22, "第 1 名")), "后者仍 0 秒排第 1");
+  assert(editorOf(BIG_B).querySelector(".penalty-seconds").value === "0", "后者编辑区仍显示 0 秒");
+  savePenalty(BIG_B, "9", "后者迟到");
+  assert(
+    globalThis.__penaltiesForTest.get(BIG_A).seconds === 7 &&
+      globalThis.__penaltiesForTest.get(BIG_B).seconds === 9,
+    "两个大编号的罚秒互不影响"
+  );
+
+  console.log("大整数编号：删行与改号立即释放原编号罚秒，改回不恢复");
+  fire(rowOfRunner(BIG_B).querySelector(".remove-runner"), "click"); // 删除后者行
+  assert(!globalThis.__penaltiesForTest.has(BIG_B), "删除后者行：其 9 秒立即释放");
+  assert(globalThis.__penaltiesForTest.get(BIG_A).seconds === 7, "前者罚秒不受影响");
+  // 仅剩前者时把编号改成后者：前者的 7 秒必须在输入事件当下立即清除
+  // （Number 精度下两个编号相同，旧实现检测不到这次改号）。
+  numInputs()[0].value = BIG_B;
+  fire(runnerRows, "input");
+  assert(!globalThis.__penaltiesForTest.has(BIG_A), "改号为另一个大编号：原编号罚秒立即清除");
+  numInputs()[0].value = BIG_A; // 改回不恢复
+  fire(runnerRows, "input");
+  fire(addRunner, "click"); // 重新添加后者，恢复两行合法状态
+  numInputs()[1].value = BIG_B;
+  fire(runnerRows, "input");
+  await adjudicate();
+  assert(slotHtml().includes(rowHtml(BIG_A, 1, 20, 0, 20, "第 1 名")), "改回后前者仍是默认 0 秒");
+  assert(slotHtml().includes(rowHtml(BIG_B, 1, 22, 0, 22, "第 2 名")), "重新添加的后者也是默认 0 秒");
+
+  console.log("大整数编号：前导零等值改写不算改号");
+  savePenalty(BIG_A, "5", "前导零测试");
+  numInputs()[0].value = "0" + BIG_A; // 09007199254740992，与前者等值
+  fire(runnerRows, "input");
+  assert(globalThis.__penaltiesForTest.get(BIG_A).seconds === 5, "前导零等值改写：罚秒保留");
+  await adjudicate();
+  assert(slotHtml().includes(rowHtml(BIG_A, 1, 20, 5, 25, "第 2 名")), "前导零改写后罚秒仍生效");
+
+  console.log("大整数编号：名次表按编号数值升序，不被浮点截断误导");
+  fire(addRunner, "click"); // 共 3 行选手
+  numInputs()[2].value = "5";
+  fire(runnerRows, "input");
+  server.raw = `{"ok":true,"result":{"runners":[` +
+    `{"runner":${BIG_B},"lapCount":0,"totalTime":0,"laps":[],"unused":[]},` +
+    `{"runner":5,"lapCount":0,"totalTime":0,"laps":[],"unused":[]},` +
+    `{"runner":${BIG_A},"lapCount":0,"totalTime":0,"laps":[],"unused":[]}]}}`;
+  await adjudicate();
+  assert(rowOrder(5, BIG_A, BIG_B), "零次者按编号数值升序：5 < 2^53 < 2^53+1");
+  // 并列同分时也按编号数值升序展示（响应顺序故意打乱）。
+  savePenalty(BIG_A, "0", ""); // 清掉前者的 5 秒，让三者调整后用时相同
+  server.raw = `{"ok":true,"result":{"runners":[` +
+    `${bigRunner(BIG_B, bigLapB, 1, 20)},` +
+    `${bigRunner(5, bigLapA, 1, 20)},` +
+    `${bigRunner(BIG_A, bigLapA, 1, 20)}]}}`;
+  await adjudicate();
+  assert(rowOrder(5, BIG_A, BIG_B), "并列第 1 时按编号数值升序展示");
+  assert(slotHtml().includes(rowHtml(BIG_A, 1, 20, 0, 20, "第 1 名")), "并列：前者第 1 名");
+  assert(slotHtml().includes(rowHtml(BIG_B, 1, 20, 0, 20, "第 1 名")), "并列：后者第 1 名");
+  server.raw = null;
 
   console.log(failures === 0 ? "\nALL RANKING SCENARIOS PASSED" : `\n${failures} ASSERTION(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);

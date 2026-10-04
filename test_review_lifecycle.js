@@ -187,17 +187,26 @@ const twoLapResult = {
   ],
 };
 
-const server = { mode: "valid", result: validResult, hold: null };
+const server = { mode: "valid", result: validResult, hold: null, raw: null };
 global.fetch = async (_url, opts) => {
   JSON.parse(opts.body); // 前端始终发送合法 JSON
+  // raw：直接以原文返回，模拟后端精确输出的大整数编号（JSON 数字可超过 2^53）。
+  const respond = (data, ok, status) => ({
+    ok,
+    status,
+    json: async () => (typeof data === "string" ? JSON.parse(data) : data),
+    text: async () => (typeof data === "string" ? data : JSON.stringify(data)),
+  });
   if (server.mode === "invalid") {
-    return { ok: false, status: 422, json: async () => ({ ok: false, error: "模拟非法输入" }) };
+    return respond({ ok: false, error: "模拟非法输入" }, false, 422);
   }
   if (server.mode === "hold") {
-    const data = await server.hold;
-    return { ok: true, status: 200, json: async () => data };
+    return respond(await server.hold, true, 200);
   }
-  return { ok: true, status: 200, json: async () => ({ ok: true, result: server.result }) };
+  if (server.raw !== null) {
+    return respond(server.raw, true, 200);
+  }
+  return respond({ ok: true, result: server.result }, true, 200);
 };
 
 /* ---------------- 加载真实 app.js ---------------- */
@@ -419,6 +428,59 @@ async function main() {
   await flush();
   assert(rendered() === "" && $("error-box").hidden, "清空后结果与错误立即消失");
   assert(fetchCount === sampleFetched, "清空不会再发请求（在途版本守卫之外的防抖已取消）");
+
+  console.log("场景11：大整数编号的复核绑定互不混同");
+  // 2^53 与 2^53+1：JS Number 无法区分（都会变成 9007199254740992），
+  // 复核绑定中的选手编号必须按规范十进制精确比较。
+  const BIG_A = "9007199254740992";
+  const BIG_B = "9007199254740993";
+  setVal("smMin", "10"); setVal("smMax", "60"); setVal("mfMin", "10"); setVal("mfMax", "60");
+  fire(addRunner, "click"); // 共 2 行选手
+  const bigInputs = [...runnerRows.querySelectorAll(".runner-number")];
+  bigInputs[0].value = BIG_A; bigInputs[1].value = BIG_B;
+  fire(runnerRows, "input");
+  for (let i = 0; i < 5; i++) fire(addRecord, "click"); // 共 6 行记录
+  setRow("ba1", BIG_A, "S", "0"); setRow("bb1", BIG_A, "M", "10"); setRow("bc1", BIG_A, "F", "20");
+  setRow("bd1", BIG_B, "S", "0"); setRow("be1", BIG_B, "M", "11"); setRow("bf1", BIG_B, "F", "22");
+  server.raw = `{"ok":true,"result":{"runners":[` +
+    `{"runner":${BIG_A},"lapCount":1,"totalTime":20,"laps":[` +
+    `{"start":{"id":"ba1","time":0},"middle":{"id":"bb1","time":10},"finish":{"id":"bc1","time":20},` +
+    `"smTime":10,"mfTime":10,"totalTime":20}],"unused":[]},` +
+    `{"runner":${BIG_B},"lapCount":1,"totalTime":22,"laps":[` +
+    `{"start":{"id":"bd1","time":0},"middle":{"id":"be1","time":11},"finish":{"id":"bf1","time":22},` +
+    `"smTime":11,"mfTime":11,"totalTime":22}],"unused":[]}]}}`;
+  await adjudicate();
+  assert(
+    rendered().includes(`选手 ${BIG_A}`) && rendered().includes(`选手 ${BIG_B}`),
+    "两个大编号分别渲染，不混同"
+  );
+  saveReview(0, "pass", "大编号备注A"); // 前者（BIG_A）的趟
+  await adjudicate();
+  assert(rendered().includes("大编号备注A"), "前者趟的复核已保存");
+  assert(
+    (rendered().match(/当前：通过/g) || []).length === 1,
+    "后者同形状趟保持未复核（不被前者的复核覆盖）"
+  );
+  // 删除前者选手行：前者的复核必须在输入事件当下立即失效——
+  // 即使后者编号在 Number 精度下与前者相同（旧实现会误判绑定仍有效）。
+  const rowBigA = [...runnerRows.querySelectorAll(".runner-row")].find(
+    (r) => r.querySelector(".runner-number").value === BIG_A
+  );
+  fire(rowBigA.querySelector(".remove-runner"), "click");
+  await adjudicate();
+  assert(!rendered().includes("大编号备注A"), "删除前者行：其复核立即失效（不与后者混同）");
+  // 后者的复核保存后，把后者改号为前者：后者的复核按原绑定立即失效。
+  saveReview(1, "doubt", "大编号备注B"); // 后者（BIG_B）的趟
+  await adjudicate();
+  assert(rendered().includes("大编号备注B"), "后者趟的复核已保存");
+  const rowBigB = [...runnerRows.querySelectorAll(".runner-row")].find(
+    (r) => r.querySelector(".runner-number").value === BIG_B
+  );
+  rowBigB.querySelector(".runner-number").value = BIG_A;
+  fire(runnerRows, "input");
+  await adjudicate();
+  assert(!rendered().includes("大编号备注B"), "后者改号为前者：后者的复核立即失效");
+  server.raw = null;
 
   console.log(failures === 0 ? "\nALL FRONTEND SCENARIOS PASSED" : `\n${failures} ASSERTION(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);
